@@ -4,8 +4,40 @@ import { Server } from "socket.io";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { v4 as uuidv4 } from "uuid";
+import net from "net";
+import { register, Counter } from "prom-client";
 
-const PORT = 3000;
+const PORT = 3002;
+const LOGSTASH_HOST = process.env.LOGSTASH_HOST || "localhost";
+const LOGSTASH_PORT = 5000;
+
+// Prometheus Metrics
+const connectionCounter = new Counter({
+  name: "chat_connections_total",
+  help: "Total number of user connections",
+});
+
+const disconnectionCounter = new Counter({
+  name: "chat_disconnections_total",
+  help: "Total number of user disconnections",
+});
+
+const messageCounter = new Counter({
+  name: "chat_messages_sent_total",
+  help: "Total number of messages sent",
+});
+
+// Function to send logs to Logstash
+function sendToLogstash(logData: any) {
+  const client = net.createConnection(LOGSTASH_PORT, LOGSTASH_HOST, () => {
+    client.write(JSON.stringify(logData) + "\n");
+    client.end();
+  });
+
+  client.on("error", (err) => {
+    console.error("Failed to connect to Logstash:", err.message);
+  });
+}
 
 async function startServer() {
   const app = express();
@@ -24,6 +56,17 @@ async function startServer() {
   // Socket.io Logic
   io.on("connection", (socket) => {
     console.log("A user connected:", socket.id);
+    
+    // Increment connection counter
+    connectionCounter.inc();
+    
+    // Send connection log to Logstash
+    sendToLogstash({
+      timestamp: new Date().toISOString(),
+      event: "user_connected",
+      socketId: socket.id,
+      message: `User connected with socket ID: ${socket.id}`,
+    });
 
     socket.on("join", ({ name, id }) => {
       let userId = id;
@@ -83,6 +126,9 @@ async function startServer() {
         timestamp: Date.now(),
       };
 
+      // Increment message counter
+      messageCounter.inc();
+
       // Store message
       messages.push(message);
       if (messages.length > 100) messages.shift();
@@ -94,6 +140,10 @@ async function startServer() {
       const user = onlineUsers.get(socket.id);
       if (user) {
         onlineUsers.delete(socket.id);
+        
+        // Increment disconnection counter
+        disconnectionCounter.inc();
+        
         const statusMsg = {
           id: uuidv4(),
           type: "status",
@@ -104,9 +154,25 @@ async function startServer() {
         if (messages.length > 100) messages.shift();
 
         io.emit("status_update", { user, status: "disconnected", message: statusMsg });
+        
+        // Send disconnection log to Logstash
+        sendToLogstash({
+          timestamp: new Date().toISOString(),
+          event: "user_disconnected",
+          socketId: socket.id,
+          userId: user.id,
+          userName: user.name,
+          message: `User ${user.name} (${user.id}) disconnected`,
+        });
       }
       console.log("User disconnected:", socket.id);
     });
+  });
+
+  // Prometheus metrics endpoint (must be before Vite middleware to take priority)
+  app.get("/metrics", async (req, res) => {
+    res.set("Content-Type", register.contentType);
+    res.end(await register.metrics());
   });
 
   // Vite middleware for development
